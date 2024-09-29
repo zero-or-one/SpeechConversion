@@ -22,15 +22,18 @@ from transformers import Seq2SeqTrainingArguments
 from transformers import Seq2SeqTrainer
 
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,3'
+#os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+
 load_dotenv()
 login(token=os.getenv("HUGGINGFACE_TOKEN"))
 
 # Load the dataset
 atypical_voice = DatasetDict()
 dataset = load_dataset("jmaczan/TORGO", split="train", use_auth_token=True)
+# take first 100 samples
+#dataset = dataset.select(range(100))
 
-'''
+
 # split randomly
 def split_dataset(dataset, test_size=300):
     # Convert to a list of indices
@@ -56,8 +59,8 @@ def split_dataset(dataset, test_size=300):
     return train_set, test_set
 
 # Assuming your dataset is named 'dataset'
-train_data, test_data = split_dataset(dataset)
-'''
+train_data, test_data = split_dataset(dataset, 30)
+
 
 '''
 # split by taking speaker 1 as validation
@@ -65,6 +68,7 @@ test_data = dataset.select(range(118))
 remaining_indices = list(range(118, len(dataset)))
 random.shuffle(remaining_indices)
 train_data = dataset.select(remaining_indices)
+'''
 '''
 # split by text
 def split_dataset(dataset, test_texts):
@@ -92,8 +96,9 @@ test_texts = [ # I took them randomly
 'knee',
 ]
 
-train_data, test_data = split_dataset(dataset, test_texts)
 
+train_data, test_data = split_dataset(dataset, test_texts)
+'''
 print(f"Train set size: {len(train_data)}")
 print(f"Test set size: {len(test_data)}")
 

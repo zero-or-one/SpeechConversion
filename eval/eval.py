@@ -15,21 +15,19 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # Load the Whisper model and processor
-model_name = "jiwon65/whisper-small_korean-zeroth"  # You can change this to other variants
-processor = WhisperProcessor.from_pretrained(model_name)
+
+model_name = "openai/whisper-large-v3"
+processor_name = model_name
+#model_name = "spow12/whisper-medium-zeroth_korean" #"openai/whisper-large-v3"  # You can change this to other variants
+#processor_name = "openai/whisper-medium"
+
+processor = WhisperProcessor.from_pretrained(processor_name, language="ko")
 model = WhisperForConditionalGeneration.from_pretrained(model_name).to(device)
-feature_extractor = WhisperFeatureExtractor.from_pretrained(model_name)
+feature_extractor = WhisperFeatureExtractor.from_pretrained(processor_name, language="ko")
 
 # Load the WER metric
 wer_metric = load("wer")
-
-# Function to compute WER for a batch
-def compute_metrics(pred_ids, labels):
-    pred_str = processor.batch_decode(pred_ids, skip_special_tokens=True)
-    label_str = labels
-    wer = wer_metric.compute(predictions=pred_str, references=label_str)
-    return {"wer": wer}
-
+cer_metric = load("cer")
 
 # Function to pad input features
 def pad_input_features(input_features, target_length=3000):
@@ -74,4 +72,8 @@ for i in range(0, len(dataset), batch_size):
 
 # Compute WER for the entire dataset
 wer = wer_metric.compute(predictions=all_predictions, references=all_references)
+cer = cer_metric.compute(predictions=all_predictions, references=all_references)
+
+print(model_name)
 print(f"Average WER: {wer:.4f}")
+print(f"Average CER: {cer:.4f}")

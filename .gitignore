@@ -5,3 +5,6 @@ valle.egg-info/
 checkpoint/
 results/
 whisper*/
+logs*/
+VC*/
+whisper-lora*/
