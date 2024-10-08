@@ -1,6 +1,6 @@
 from dotenv import load_dotenv 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2,3'
 
 from huggingface_hub import login
 import random
@@ -26,7 +26,7 @@ import evaluate
 
 import json
 from pydub import AudioSegment
-from time import time
+from time import time, sleep
 
 from collections import Counter
 import math
@@ -34,6 +34,10 @@ import math
 # LoRA imports
 from peft import LoraConfig, get_peft_model, prepare_model_for_int8_training
 from peft import TaskType
+
+# Wait for 4.5 hours
+#print("Waiting for 4.5 hours")
+#sleep(4.5*60*60)
 
 # Load environment variables
 load_dotenv()
@@ -53,8 +57,8 @@ def calculate_dataset_duration(dataset):
     return total_duration
 
 # Load the dataset
-train_dataset_path = '/home/sabina/speech_handicap_dataset/imijeong/train.json'
-test_dataset_path = '/home/sabina/speech_handicap_dataset/imijeong/test.json'
+train_dataset_path = './train.json'
+test_dataset_path = './test.json'
 
 train_data = load_dataset('json', data_files=train_dataset_path)
 test_data = load_dataset('json', data_files=test_dataset_path)
@@ -81,7 +85,7 @@ total_duration = train_duration + test_duration
 print(f"Total dataset duration: {format_duration(total_duration)}")
 
 # Load the Whisper model and processor
-model_name = 'jiwon65/whisper-small_korean-zeroth'
+model_name = 'seastar105/whisper-medium-ko-zeroth'
 processor_name = model_name
 
 feature_extractor = WhisperFeatureExtractor.from_pretrained(processor_name)
@@ -109,13 +113,31 @@ atypical_voice = atypical_voice.map(prepare_dataset, remove_columns=atypical_voi
 
 # Load Whisper model and set up LoRA
 model = WhisperForConditionalGeneration.from_pretrained(model_name)
+
+# claude
+gen_config = GenerationConfig.from_model_config(model.config)
+gen_config.task = "transcribe"
+#gen_config.language = "en"
+gen_config.task_to_id = {
+    "transcribe": 50359,
+    "translate": 50358
+  }
+
+# Clear forced_decoder_ids and suppress_tokens
+gen_config.forced_decoder_ids = None
+gen_config.suppress_tokens = []
+
+# Assign the generation config to the model
+model.generation_config = gen_config
+
+
 model = prepare_model_for_int8_training(model)  # Make model ready for LoRA with int8 optimization
 
 # LoRA configuration
 lora_config = LoraConfig(
-    r=16, 
-    lora_alpha=32, 
-    target_modules=["q_proj", "v_proj"],  # Specify layers to apply LoRA
+    r=32, 
+    lora_alpha=64, 
+    target_modules=["q_proj", "v_proj", "o_proj", "k_proj"],
     lora_dropout=0.05, 
     bias="none"
 )
@@ -196,16 +218,16 @@ def compute_metrics(pred):
 # Training arguments
 training_args = Seq2SeqTrainingArguments(
     output_dir=f"whisper-lora-{train_duration_str}",
-    per_device_train_batch_size=8,
+    per_device_train_batch_size=4,
     gradient_accumulation_steps=2,
-    learning_rate=1e-5,
-    num_train_epochs=30,  # Adjusted for LoRA training
+    learning_rate=2e-5,
+    num_train_epochs=20,  # Adjusted for LoRA training
     fp16=True,
     evaluation_strategy="epoch",
     per_device_eval_batch_size=4,
     predict_with_generate=True,
     save_strategy="epoch",
-    save_total_limit=2,
+    save_total_limit=1,
     logging_strategy="epoch",
     report_to=["tensorboard"],
     push_to_hub=False,

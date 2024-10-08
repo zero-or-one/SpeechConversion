@@ -1,6 +1,6 @@
 from dotenv import load_dotenv 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2,3'
 
 
 from huggingface_hub import login
@@ -18,7 +18,7 @@ from transformers import GenerationConfig
 from transformers import TrainerCallback
 
 import torch
-import torch.nn as nn
+torch.autograd.set_detect_anomaly(True)
 import numpy as np
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
@@ -29,8 +29,11 @@ from transformers import Seq2SeqTrainer
 import json
 from pydub import AudioSegment
 from time import sleep, time
-from peft import PeftModel, PeftConfig, LoraConfig, get_peft_model
+
 from collections import Counter
+# LoRA imports
+from peft import LoraConfig, get_peft_model, prepare_model_for_int8_training
+from peft import TaskType
 
 import math
 #print('Waiting for 7 hours')
@@ -65,6 +68,7 @@ test_data = load_dataset('json', data_files=test_dataset_path)
 
 
 
+
 print(f"Train set size: {len(train_data['train'])}")
 print(f"Test set size: {len(test_data['train'])}")
 
@@ -93,13 +97,10 @@ print(f"Total dataset duration: {format_duration(total_duration)}")
 
 
 #model_name = 'jiwon65/whisper-small_korean-zeroth'
-#model_name = 'openai/whisper-large-v3'
 #model_name = 'seastar105/whisper-medium-ko-zeroth'
-#model_name = 'VC-01-22-0.77-medium'
-#model_name = 'VC-01-22-4.30-turbo'
-model_name = 'VC-01-32-22.37-turbo'
+model_name = "openai/whisper-large-v3"
 processor_name = model_name
-repo_name = f'VC-turbo-adapter-32min'
+repo_name = f'VC-{train_duration_str}-large-lora-4'
 
 feature_extractor = WhisperFeatureExtractor.from_pretrained(processor_name)
 tokenizer = WhisperTokenizer.from_pretrained(processor_name, task="transcribe", language='ko')
@@ -147,118 +148,60 @@ def calculate_token_weights(dataset, tokenizer):
 
     return token_weights
 
-if not os.path.exists(f'token_weights_{train_duration_str}-turbo.json'):
+if True#not os.path.exists(f'token_weights_{train_duration_str}.json'):
     token_weights = calculate_token_weights(atypical_voice, tokenizer)
 
     # Save token weights to a JSON file
-    with open(f'token_weights_{train_duration_str}-turbo.json', 'w') as f:
+    with open(f'token_weights_{train_duration_str}-large.json', 'w') as f:
         json.dump(token_weights, f)
 
-    print(f"Token weights have been calculated and saved to 'token_weights_{train_duration_str}-turbo.json'")
+    print(f"Token weights have been calculated and saved to 'token_weights_{train_duration_str}-large.json'")
 
 atypical_voice = atypical_voice.map(prepare_dataset, remove_columns=atypical_voice.column_names["train"], num_proc=1)
 
-
-# Feature Adapter
-class FeatureAdapter(nn.Module):
-    def __init__(self, input_size, output_size, use_cnn=False):
-        super(FeatureAdapter, self).__init__()
-        hidden_size = 64  # Hidden size for the FC layers
-        # Optionally choose between FC or CNN
-        if use_cnn:
-            self.layer1 = nn.Conv1d(in_channels=input_size, out_channels=128, kernel_size=3, padding=1, bias=False)
-            self.layer2 = nn.Conv1d(in_channels=128, out_channels=128, kernel_size=3, padding=1, bias=False)
-            self.layer3 = nn.Conv1d(in_channels=128, out_channels=output_size, kernel_size=3, padding=1, bias=False)
-        else:
-            self.layer1 = nn.Linear(input_size, hidden_size, bias=False)
-            self.layer2 = nn.Linear(hidden_size, hidden_size, bias=False)
-            self.layer3 = nn.Linear(hidden_size, output_size, bias=False)
-            #self.layer4 = nn.Linear(96, 96, bias=False)
-            #self.layer5 = nn.Linear(96, output_size, bias=False)
-        # Residual connections and initialization with small values
-        self.relu = nn.ReLU()
-        self.initialize_weights()
-        self.prev_weights = [layer.weight.data.clone() for layer in [self.layer1, self.layer2, self.layer3]]
-
-    def initialize_weights(self):
-        # Small random values for initialization
-        for layer in [self.layer1, self.layer2, self.layer3]:
-            if isinstance(layer, nn.Linear) or isinstance(layer, nn.Conv1d):
-                nn.init.normal_(layer.weight, mean=0.0, std=1e-2)
-                #nn.init.constant_(layer.weight, 0.0)
-
-    def forward(self, x):
-        x = x.transpose(1, 2)
-        residual = x
-        #print('x', x.shape)
-        x = self.relu(self.layer1(x))
-        x = self.relu(self.layer2(x))
-        x = self.relu(self.layer3(x))
-        
-        #x = self.relu(self.layer4(x))
-        #x = self.relu(self.layer5(x))
-        
-        x = x + residual
-        x = x.transpose(1, 2)
-        return x
-
-    def check_weight_update(self):
-        current_weights = [layer.weight.data for layer in [self.layer1, self.layer2, self.layer3]]
-        device = current_weights[0].device
-        weight_changes = [torch.abs(curr.to(device) - prev.to(device)).mean().item() for curr, prev in zip(current_weights, self.prev_weights)]
-        self.prev_weights = [w.clone() for w in current_weights]
-        return weight_changes
-
-# Modified Whisper model
-class ModifiedWhisperModel(WhisperForConditionalGeneration):
-    def __init__(self, config, use_cnn=False):
-        super(ModifiedWhisperModel, self).__init__(config)
-        
-        #for param in self.parameters():
-        #    param.requires_grad = False
-        
-        self.preprocessor = FeatureAdapter(input_size=128, output_size=128, use_cnn=use_cnn)
-    
-    def forward(self, **kwargs):
-        input_features = kwargs.get("input_features")
-        if input_features is None:
-            return super(ModifiedWhisperModel, self).forward(**kwargs)
-        
-        preprocessed_features = self.preprocessor(input_features)
-        kwargs["input_features"] = preprocessed_features
-        outputs = super(ModifiedWhisperModel, self).forward(**kwargs)
-        return outputs
-    
-    def generate(self, **kwargs):
-        kwargs.pop('labels', None)
-        return super(ModifiedWhisperModel, self).generate(**kwargs)
-    
-
-# Load pre-trained model with LoRA layers
-model = ModifiedWhisperModel.from_pretrained(model_name, use_cnn=False)
+# Training and Evaluation
+model = WhisperForConditionalGeneration.from_pretrained(model_name)
 
 
 # claude
 gen_config = GenerationConfig.from_model_config(model.config)
 gen_config.task = "transcribe"
-gen_config.language = "ko"
+#gen_config.language = "en"
 gen_config.task_to_id = {
     "transcribe": 50359,
     "translate": 50358
   }
+
 # Clear forced_decoder_ids and suppress_tokens
 gen_config.forced_decoder_ids = None
 gen_config.suppress_tokens = []
-gen_config.language = "ko"
-language_to_id_map = {
-    "en": 50259,  # English
-    "ko": 50263,  # Korean
-    # Add more languages as needed
-}
-gen_config.lang_to_id = language_to_id_map
+
+# Assign the generation config to the model
 model.generation_config = gen_config
 
+model = prepare_model_for_int8_training(model)  # Make model ready for LoRA with int8 optimization
 
+# LoRA configuration
+lora_config = LoraConfig(
+    r=16, 
+    lora_alpha=32, 
+    target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.05, 
+    bias="none"
+)
+
+# Wrap the Whisper model with LoRA
+model = get_peft_model(model, lora_config)
+print("LoRA model initialized.")
+
+'''
+for name, param in model.named_parameters():
+    if param.requires_grad:
+        print(f"{name}: Trainable")
+    else:
+        print(f"{name}: Frozen (not trainable)")
+exit()
+'''
 
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
@@ -330,20 +273,28 @@ def compute_metrics(pred):
     # Compute WER
     wer = 100 * wer_metric.compute(predictions=pred_str, references=label_str)
     cer = 100 * cer_metric.compute(predictions=pred_str, references=label_str)
-
+    '''
+    # Log individual sample WERs
+    individual_wers = [100 * wer_metric.compute(predictions=[p], references=[l]) for p, l in zip(pred_str, label_str)]
+    individual_cers = [100 * cer_metric.compute(predictions=[p], references=[l]) for p, l in zip(pred_str, label_str)]
+    #print("Individual WERs for first 5 samples:")
+    print(individual_wers[16:36])
+    print(individual_cers[16:36])
+    print(f"WER: {wer:.2f}, CER: {cer:.2f}")
+    print(f"Mean WER: {np.mean(individual_wers):.2f}, Mean CER: {np.mean(individual_cers):.2f}")
+    '''
     return {"wer": wer, "cer": cer}
 
 
 training_args = Seq2SeqTrainingArguments(
     output_dir=repo_name,
-    per_device_train_batch_size=8,
-    gradient_accumulation_steps=2,
-    learning_rate=1e-5,
-    num_train_epochs=20,  # Maximum number of epochs
-    gradient_checkpointing=True,
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=1,
+    learning_rate=2e-5,
+    num_train_epochs=30,  # Maximum number of epochs
     fp16=True,
     evaluation_strategy="epoch",
-    per_device_eval_batch_size=2,
+    per_device_eval_batch_size=4,
     predict_with_generate=True,
     generation_max_length=225,
     save_strategy="epoch",
@@ -356,9 +307,6 @@ training_args = Seq2SeqTrainingArguments(
     push_to_hub=True,
     logging_first_step=True,
     lr_scheduler_type="cosine",
-    remove_unused_columns=False,
-    #weight_decay=1e-2,
-    #warmup_steps=100,
 )
 
 class HalfEpochCallback(TrainerCallback):
@@ -369,43 +317,29 @@ class HalfEpochCallback(TrainerCallback):
             control.should_log = True
 
 # overwrite new class
-class FeatureAdapterMonitorCallback(TrainerCallback):
-    def __init__(self, log_steps=1):
-        self.log_steps = log_steps
-
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if state.global_step % self.log_steps == 0:
-            weight_changes = model.preprocessor.check_weight_update()
-            print(f"Step {state.global_step}: Feature Adapter weight changes: {weight_changes}")
-
-# Modified CustomWhisperTrainer
 class CustomWhisperTrainer(Seq2SeqTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        with open(f'token_weights_{train_duration_str}-turbo.json', 'r') as f:
+        # load from token_weights.json
+        with open(f'token_weights_{train_duration_str}-large.json', 'r') as f:
             token_weights = json.load(f)
 
-        weights_tensor = torch.ones(51866)
+        weights_tensor = torch.ones(51866)  # V3 has more tokens?``
         for token_index, weight in token_weights.items():
-            weights_tensor[int(token_index)] = weight
-        self.class_weights = weights_tensor.to(self.args.device)
+            #print(f"Token index: {token_index}, weight: {weight}")
+            weights_tensor[int(token_index)] = weight  # Update the tensor with the weight
+        self.class_weights = weights_tensor.to(self.args.device)  # Move tensor to the device
 
+        # Initialize variables to track best metrics
         self.best_cer = float('inf')
         self.best_wer = float('inf')
-        
-    def training_step(self, model, inputs):
-        loss = super().training_step(model, inputs)
-        
-        # Clip gradients for the preprocessor
-        #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-        
-        return loss
-    
+
     def compute_loss(self, model, inputs, return_outputs=False):
         labels = inputs.get("labels")
         outputs = model(**inputs)
         logits = outputs.get("logits")
         
+        # Calculate weighted cross-entropy loss
         loss_fct = torch.nn.CrossEntropyLoss(weight=self.class_weights, reduction='mean')
         loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
         
@@ -413,6 +347,7 @@ class CustomWhisperTrainer(Seq2SeqTrainer):
     
     def log(self, logs):
         super().log(logs)
+        # Update best CER and WER
         if 'eval_cer' in logs and logs['eval_cer'] < self.best_cer:
             self.best_cer = logs['eval_cer']
         if 'eval_wer' in logs and logs['eval_wer'] < self.best_wer:
@@ -433,16 +368,15 @@ trainer = CustomWhisperTrainer(
     data_collator=data_collator,
     compute_metrics=compute_metrics,
     tokenizer=processor.feature_extractor,
-    callbacks=[HalfEpochCallback()] #, FeatureAdapterMonitorCallback()],
+    callbacks=[HalfEpochCallback()]
 )
 processor.save_pretrained(training_args.output_dir)
 
 train_start = time()
 print(model.config)
-print('Evaluating the model before training')
-trainer.evaluate()
+#print('Evaluating the model before training')
+#trainer.evaluate()
 #exit()
-
 print('Training the model')
 trainer.train()
 

@@ -1,6 +1,6 @@
 from dotenv import load_dotenv 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2,3'
 
 
 from huggingface_hub import login
@@ -94,12 +94,10 @@ print(f"Total dataset duration: {format_duration(total_duration)}")
 
 #model_name = 'jiwon65/whisper-small_korean-zeroth'
 #model_name = 'openai/whisper-large-v3'
-#model_name = 'seastar105/whisper-medium-ko-zeroth'
 #model_name = 'VC-01-22-0.77-medium'
-#model_name = 'VC-01-22-4.30-turbo'
-model_name = 'VC-01-32-22.37-turbo'
+model_name = 'VC-01-22-4.30-large-lora-4'
 processor_name = model_name
-repo_name = f'VC-turbo-adapter-32min'
+repo_name = f'VC-large-adapter'
 
 feature_extractor = WhisperFeatureExtractor.from_pretrained(processor_name)
 tokenizer = WhisperTokenizer.from_pretrained(processor_name, task="transcribe", language='ko')
@@ -147,14 +145,14 @@ def calculate_token_weights(dataset, tokenizer):
 
     return token_weights
 
-if not os.path.exists(f'token_weights_{train_duration_str}-turbo.json'):
+if not os.path.exists(f'token_weights_{train_duration_str}-large.json'):
     token_weights = calculate_token_weights(atypical_voice, tokenizer)
 
     # Save token weights to a JSON file
-    with open(f'token_weights_{train_duration_str}-turbo.json', 'w') as f:
+    with open(f'token_weights_{train_duration_str}-large.json', 'w') as f:
         json.dump(token_weights, f)
 
-    print(f"Token weights have been calculated and saved to 'token_weights_{train_duration_str}-turbo.json'")
+    print(f"Token weights have been calculated and saved to 'token_weights_{train_duration_str}.json'")
 
 atypical_voice = atypical_voice.map(prepare_dataset, remove_columns=atypical_voice.column_names["train"], num_proc=1)
 
@@ -173,8 +171,6 @@ class FeatureAdapter(nn.Module):
             self.layer1 = nn.Linear(input_size, hidden_size, bias=False)
             self.layer2 = nn.Linear(hidden_size, hidden_size, bias=False)
             self.layer3 = nn.Linear(hidden_size, output_size, bias=False)
-            #self.layer4 = nn.Linear(96, 96, bias=False)
-            #self.layer5 = nn.Linear(96, output_size, bias=False)
         # Residual connections and initialization with small values
         self.relu = nn.ReLU()
         self.initialize_weights()
@@ -194,10 +190,6 @@ class FeatureAdapter(nn.Module):
         x = self.relu(self.layer1(x))
         x = self.relu(self.layer2(x))
         x = self.relu(self.layer3(x))
-        
-        #x = self.relu(self.layer4(x))
-        #x = self.relu(self.layer5(x))
-        
         x = x + residual
         x = x.transpose(1, 2)
         return x
@@ -235,11 +227,11 @@ class ModifiedWhisperModel(WhisperForConditionalGeneration):
     
 
 # Load pre-trained model with LoRA layers
-model = ModifiedWhisperModel.from_pretrained(model_name, use_cnn=False)
+base_model = ModifiedWhisperModel.from_pretrained(model_name, use_cnn=False)
 
 
 # claude
-gen_config = GenerationConfig.from_model_config(model.config)
+gen_config = GenerationConfig.from_model_config(base_model.config)
 gen_config.task = "transcribe"
 gen_config.language = "ko"
 gen_config.task_to_id = {
@@ -256,7 +248,45 @@ language_to_id_map = {
     # Add more languages as needed
 }
 gen_config.lang_to_id = language_to_id_map
-model.generation_config = gen_config
+base_model.generation_config = gen_config
+
+adapter_name = model_name
+adapter_path = f'{adapter_name}'
+peft_config = PeftConfig.from_pretrained(adapter_path)
+model = PeftModel(base_model, peft_config)
+
+'''
+# LoRA config
+lora_config = LoraConfig(
+    r=16,  # Dimension of the low-rank approximation
+    lora_alpha=32,  # LoRA scaling factor
+    lora_dropout=0.05,  # Dropout for LoRA layers
+    target_modules=["q_proj", "v_proj"],  # Apply LoRA to attention layers
+)
+
+# Load pre-trained model with LoRA layers
+model = get_peft_model(base_model, lora_config)
+'''
+
+# Freeze all model parameters except LoRA layers and FeatureAdapter layers
+for param in model.parameters():
+    param.requires_grad = False
+# Make LoRA layers trainable
+for name, param in model.named_parameters():
+    if 'lora' in name:  # LoRA layers are automatically named with 'lora'
+        param.requires_grad = True
+
+# Make Feature Adapter layers trainable as well
+for name, param in model.preprocessor.named_parameters():
+    param.requires_grad = True
+
+# make output layer trainable as well
+#for param in model.proj_out.parameters():
+#    param.requires_grad = True
+
+# Ensure that the LoRA layers and the Feature Adapter layers are trainable
+trainable_params = [n for n, p in model.named_parameters() if p.requires_grad]
+print(f"Trainable parameters: {trainable_params}")
 
 
 
@@ -339,7 +369,7 @@ training_args = Seq2SeqTrainingArguments(
     per_device_train_batch_size=8,
     gradient_accumulation_steps=2,
     learning_rate=1e-5,
-    num_train_epochs=20,  # Maximum number of epochs
+    num_train_epochs=60,  # Maximum number of epochs
     gradient_checkpointing=True,
     fp16=True,
     evaluation_strategy="epoch",
@@ -382,7 +412,7 @@ class FeatureAdapterMonitorCallback(TrainerCallback):
 class CustomWhisperTrainer(Seq2SeqTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        with open(f'token_weights_{train_duration_str}-turbo.json', 'r') as f:
+        with open(f'token_weights_{train_duration_str}.json', 'r') as f:
             token_weights = json.load(f)
 
         weights_tensor = torch.ones(51866)
