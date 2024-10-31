@@ -1,29 +1,46 @@
 import os
 import json
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 import torch
 from transformers import WhisperFeatureExtractor, WhisperTokenizer, WhisperProcessor, WhisperForConditionalGeneration
 from datasets import load_dataset, DatasetDict, Dataset
 from datasets import Audio
-import evaluate
 from tqdm import tqdm
 #from openai import OpenAI
 from pydub import AudioSegment
 from time import time
 import re
-#client = OpenAI(api_key="")
+from dotenv import load_dotenv
+from metrics import ASRMetrics
+import numpy as np
+
+load_dotenv()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
+# / START SETUP
 # Load the dataset
 test_name = 'test'
-dataset_path = f'./{test_name}.json'
-dataset = load_dataset('json', data_files=dataset_path)
+#test_name = 'valid'
+
+speaker = 'JHJ_Woman_40s'
+target_dataset = os.path.join('dataset', speaker)
+dataset_path = os.path.join(target_dataset, f"{test_name}.json")
+dataset = load_dataset('json', data_files
+                       =dataset_path)
+#model_path = 'openai/whisper-large-v3-turbo'
+model_path = 'VC-0.05dr-JHJ_Woman_40s-01-08-35.48'
+model_name = model_path
+
+TIME_WRAPPING = True
+DELETION_RATE = 0.1
+revision = None #'348fd0412ddac4e60d56dda36458e134d35f8d4d'
 
 # Split the test dataset into two halves (only for larger training data)
-test_data_split = dataset['train'].train_test_split(test_size=0.5, seed=42)
-dataset['train'] = test_data_split['test']
+#test_data_split = dataset['train'].train_test_split(test_size=0.5, seed=42)
+#dataset['train'] = test_data_split['train']
+#dataset['train'] = test_data_split['test']
+# /END SETUP 
 
 def calculate_dataset_duration(dataset):
     total_duration = 0
@@ -54,112 +71,120 @@ dataset = dataset.rename_column('sentence', 'transcription')
 # Create the validation dataset from the test indices
 val_dataset = dataset['train']
 
-# Load the model and processor
 
-#model_path = "VC-01-22-4.30-medium"
-#model_path = "whisper_large-feature-merged"
-#model_name = model_path
 
-model_name = '_'
-#model_path = 'seastar105/whisper-medium-ko-zeroth'
-#model_path = "openai/whisper-large-v3"
-#model_path = 'VC-01-22-4.30-turbo'
-model_path = 'VC-01-32-22.37-turbo'
-
-feature_extractor = WhisperFeatureExtractor.from_pretrained(model_path)
-tokenizer = WhisperTokenizer.from_pretrained(model_path, task="transcribe", language='ko')
-processor = WhisperProcessor.from_pretrained(model_path, task="transcribe", language='ko')
-model = WhisperForConditionalGeneration.from_pretrained(model_path).to(device)
+feature_extractor = WhisperFeatureExtractor.from_pretrained(model_path, token=os.getenv("HUGGINGFACE_TOKEN"), revision=revision)
+tokenizer = WhisperTokenizer.from_pretrained(model_path, task="transcribe", language='ko', token=os.getenv("HUGGINGFACE_TOKEN"), revision=revision)
+processor = WhisperProcessor.from_pretrained(model_path, task="transcribe", language='ko', token=os.getenv("HUGGINGFACE_TOKEN"), revision=revision)
+model = WhisperForConditionalGeneration.from_pretrained(model_path, token=os.getenv("HUGGINGFACE_TOKEN"), revision=revision).to(device)
 model = model.eval()
 
-def prepare_dataset(batch):
-    # load and resample audio data from 48 to 16kHz
-    audio = batch["audio"]
-    # compute log-Mel input features from input audio array
-    input_features = feature_extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
-    batch["input_features"] = torch.tensor(input_features)
-    # encode target text to label ids
-    batch["labels"] = tokenizer(batch["transcription"]).input_ids
-    return batch
+def spectrogram_processing(m, deletion_rate=0.1):
+    """
+    Augment a mel-spectrogram by randomly deleting frames with a probability inversely proportional
+    to the frame-to-frame differences. Frames with smaller differences (less informative) have a higher
+    chance of being deleted.
 
-column_names = val_dataset.column_names
-val_dataset = val_dataset.map(prepare_dataset, remove_columns=column_names, num_proc=1)
+    Parameters:
+    m (numpy.ndarray): Input spectrogram of shape (F, T).
+    deletion_rate (float): Controls the overall rate of frame deletion (between 0 and 1).
 
+    Returns:
+    numpy.ndarray: Augmented spectrogram of shape (F, T').
+    """
+    # Transpose the matrix to have the shape (T, F)
+    m = m.T
+    T, F = m.shape
 
+    # Compute frame-to-frame differences
+    d = np.sum(np.abs(m[1:, :] - m[:-1, :]), axis=1)
+    # Pad d with a zero at the beginning to make it length T
+    d = np.concatenate(([0], d))
 
-'''
-system_prompt = "You are a helpful assistant for the company. Your task is to correct only spelling and minor grammatical errors in the transcribed Korean text. Ensure that the original meaning is preserved and avoid changing the words or phrasing unnecessarily. Focus on improving accuracy while making minimal alterations."
-def generate_corrected_transcript(temperature, system_prompt, transcription):
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        temperature=temperature,
-        messages=[
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": transcription
-            }
-        ]
-    )
-    return response.choices[0].message.content
-'''
+    # Normalize differences and invert to get deletion probabilities
+    dmax = np.max(d)
+    if dmax == 0:
+        # Avoid division by zero if dmax is zero
+        print("Warning: dmax is zero, returning unprocessed spectrogram")
+        pd = np.ones(T) * deletion_rate
+    else:
+        # Invert differences: frames with smaller changes have higher deletion probability
+        pd = (1 - (d / dmax)) * deletion_rate
 
+    # Generate random numbers and determine which frames to delete
+    random_values = np.random.rand(T)
+    flags = random_values < pd
 
-all_predictions = []
-all_llm_predictions = []
-all_references = []
+    # Ensure the first few frames are not deleted
+    flags[:4] = False
 
-start = time()
-for batch in tqdm(val_dataset):
-    input_features = batch["input_features"]
+    # Delete frames where flags are True
+    m_processed = m[~flags, :]
+
+    # Transpose back to original shape (F, T')
+    m_processed = m_processed.T
+    return m_processed
+
+def process_and_transcribe(audio_sample):
+    # Preprocess audio
+    input_features = feature_extractor(audio_sample["array"], sampling_rate=audio_sample["sampling_rate"],
+                                       padding=False).input_features[0]
+    if TIME_WRAPPING:
+        input_features = spectrogram_processing(input_features, deletion_rate=DELETION_RATE)
+        # pad to 3000 frames
+        if input_features.shape[1] < 3000:
+            input_features = np.pad(input_features, ((0, 0), (0, 3000 - input_features.shape[1])), mode='constant')
+
     input_features = torch.tensor(input_features).unsqueeze(0).to(device)
-    #print(input_features.shape)
-    input_ids = model.generate(input_features, max_length=225, num_beams=5, early_stopping=True)[0]
-    prediction = processor.decode(input_ids, skip_special_tokens=True)
-    reference = processor.decode(batch["labels"], skip_special_tokens=True)
-    #llm_predtion = generate_corrected_transcript(0, system_prompt, prediction)
     
+    # Generate transcription
+    with torch.no_grad():
+        input_ids = model.generate(input_features, max_length=225, num_beams=5, early_stopping=True)[0]
+    
+    # Decode the transcription
+    prediction = processor.decode(input_ids, skip_special_tokens=True)
+    
+    return prediction.strip()
+
+# Process samples and calculate metrics
+all_predictions = []
+all_references = []
+total_time = 0
+total_audio_duration = 0
+
+for sample in tqdm(val_dataset):
+    # Calculate audio duration
+    audio_duration = len(sample['audio']['array']) / sample['audio']['sampling_rate']
+    total_audio_duration += audio_duration
+    
+    # Process and transcribe
+    start_time = time()
+    prediction = process_and_transcribe(sample['audio'])
+    end_time = time()
+    
+    # Calculate processing time
+    processing_time = end_time - start_time
+    total_time += processing_time
+    
+    # Store results
     all_predictions.append(prediction)
-    #all_llm_predictions.append(llm_predtion)
-    all_references.append(reference)
+    all_references.append(sample['transcription'])
 
-print("Average time per sample: ", (time() - start) / len(val_dataset))
-
-# Save the predictions and ground truth text
-with open(f"predictions_{model_name}.txt", "w") as f:
-    f.write("\n".join(all_predictions))
-
-with open(f"references_{model_name}.txt", "w") as f:
-    f.write("\n".join(all_references))
+# Calculate and print metrics
+print(f"Total audio duration: {total_audio_duration:.2f} seconds")
+print(f"Total processing time: {total_time:.2f} seconds")
+print(f"Real-time factor: {total_time / total_audio_duration:.2f}")
+print(f"Average processing time: {total_time / len(val_dataset):.2f} seconds")
 
 # Evaluate the model
-metric = evaluate.load("wer")
-metric_cer = evaluate.load("cer")
-
-print("With punctuation")
-wer = 100 * metric.compute(predictions=all_predictions, references=all_references)
-cer = 100 * metric_cer.compute(predictions=all_predictions, references=all_references)
-print(f"WER: {wer:.2f}%")
-print(f"CER: {cer:.2f}%")
+metrics = ASRMetrics()
+wer = metrics.calculate_metrics_batched(all_predictions, all_references)
 
 
-print("Without punctuation")
-sub_references = [re.sub('[!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~]', '', ref.replace('\n', '')).strip() for ref in all_references]
-sub_predictions = [re.sub('[!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~]', '', pred.replace('\n', '')).strip() for pred in all_predictions]
+model_name = model_name.split("/")[-1]
+# Save the predictions and ground truth text
+with open(f"predictions_{model_name}_{test_name}.txt", "w") as f:
+    f.write("\n".join(all_predictions))
 
-
-wer = 100 * metric.compute(predictions=sub_predictions, references=sub_references)
-cer = 100 * metric_cer.compute(predictions=sub_predictions, references=sub_references)
-
-print(f"WER: {wer:.2f}%")
-print(f"CER: {cer:.2f}%")
-'''
-llm_wer = 100 * metric.compute(predictions=all_llm_predictions, references=all_references)
-llm_cer = 100 * metric_cer.compute(predictions=all_llm_predictions, references=all_references)
-
-print(f"LLM WER: {llm_wer:.2f}%")
-print(f"LLM CER: {llm_cer:.2f}%")
-'''
+with open(f"references_{model_name}_{test_name}.txt", "w") as f:
+    f.write("\n".join(all_references))

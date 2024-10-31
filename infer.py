@@ -1,22 +1,10 @@
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
-import librosa
-
-import os
-import torch
 from openvoice import se_extractor
 from openvoice.api import ToneColorConverter
 import sys
 sys.path.append('MeloTTS')
 from melo.api import TTS
-
-
-def asr_infer_whisper_hf(model, processor, audio_path):
-    audio_input, sampling_rate = librosa.load(audio_path, sr=16000)
-
-    input_features = processor(audio_input, sampling_rate=sampling_rate, return_tensors="pt").input_features
-    predicted_ids = model.generate(input_features)
-    transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)
-    return transcription
+from stt import STT
+import os
 
 
 def tts_infer_openvoice(tts, tone_color_converter, text, reference, speed=1, output_dir='results', file_name='output', device='cuda:0'):
@@ -46,31 +34,34 @@ def tts_infer_openvoice(tts, tone_color_converter, text, reference, speed=1, out
         tgt_se=target_se, 
         output_path=save_path,
         message=encode_message)
-    
 
 
 if __name__ == "__main__":
     from argparse import ArgumentParser
+    import torch
+    
     parser = ArgumentParser()
-    parser.add_argument("--model", type=str, default="base", help="Path to the model")
     parser.add_argument("--audio_path", default="audio/n1.wav", type=str, help="Path to the audio file")
-    parser.add_argument("--tts", type=str, default="EN_NEWEST", help="model to use for TTS")
+    parser.add_argument("--tts", type=str, default="KR", help="model to use for TTS")
     parser.add_argument("--speed", default=1, type=float, help="Speed of the TTS")
     parser.add_argument("--device", default="cuda:0", type=str, help="Device to run the model on")
+    parser.add_argument("--speaker_id", default="MJY_Woman_40s", type=str, help="Speaker ID for STT model")
 
     args = parser.parse_args()
 
-    processor = WhisperProcessor.from_pretrained("/home/sabina/SpeechConversion/train/whisper-small-voice-conversion")
-    model = WhisperForConditionalGeneration.from_pretrained("/home/sabina/SpeechConversion/train/whisper-small-voice-conversion")
-    model.config.forced_decoder_ids = None
+    # Initialize STT model with the specified speaker
+    stt_model = STT(args.speaker_id, device=args.device)
     
-    text = asr_infer_whisper_hf(model, processor, args.audio_path)[0]
+    # Perform speech-to-text
+    text = stt_model.transcribe(args.audio_path)
     print("ASR Result:", text)
 
+    # Initialize TTS and tone color converter
     tone_color_converter = ToneColorConverter(f'checkpoint/config.json', device=args.device)
     tone_color_converter.load_ckpt(f'checkpoint/converter.pth')
     tts = TTS(language=args.tts, device=args.device)
     file_name = text.split()[0].lower()
 
+    # Perform TTS and voice conversion
     tts_infer_openvoice(tts, tone_color_converter, text, args.audio_path, speed=args.speed, device=args.device, file_name=file_name)
     print(f"Output saved to results/{file_name}.wav")

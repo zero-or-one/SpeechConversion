@@ -8,3 +8,6 @@ whisper*/
 logs*/
 VC*/
 whisper-lora*/
+.env
+*.json
+*.txt
